@@ -5,9 +5,10 @@ import { getContractReadOnly, getContractWithSigner } from "./components/useCont
 import "./App.css";
 import { useAccount } from 'wagmi';
 import { useFhevm, useEncrypt, useDecrypt } from '../fhevm-sdk/src';
+import { ethers } from 'ethers';
 
 interface ShareholderData {
-  id: string;
+  id: number;
   name: string;
   shares: string;
   percentage: string;
@@ -17,6 +18,14 @@ interface ShareholderData {
   publicValue2: number;
   isVerified?: boolean;
   decryptedValue?: number;
+  encryptedValueHandle?: string;
+}
+
+interface CapTableStats {
+  totalShares: number;
+  totalShareholders: number;
+  verifiedData: number;
+  avgOwnership: number;
 }
 
 const App: React.FC = () => {
@@ -28,34 +37,44 @@ const App: React.FC = () => {
   const [creatingShareholder, setCreatingShareholder] = useState(false);
   const [transactionStatus, setTransactionStatus] = useState<{ visible: boolean; status: "pending" | "success" | "error"; message: string; }>({ 
     visible: false, 
-    status: "pending", 
+    status: "pending" as const, 
     message: "" 
   });
   const [newShareholderData, setNewShareholderData] = useState({ name: "", shares: "", percentage: "" });
   const [selectedShareholder, setSelectedShareholder] = useState<ShareholderData | null>(null);
-  const [decryptedShares, setDecryptedShares] = useState<number | null>(null);
+  const [decryptedData, setDecryptedData] = useState<{ shares: number | null; percentage: number | null }>({ shares: null, percentage: null });
   const [isDecrypting, setIsDecrypting] = useState(false);
   const [contractAddress, setContractAddress] = useState("");
   const [fhevmInitializing, setFhevmInitializing] = useState(false);
   const [searchTerm, setSearchTerm] = useState("");
-  const [activeTab, setActiveTab] = useState("all");
+  const [currentPage, setCurrentPage] = useState(1);
+  const itemsPerPage = 5;
+  const [stats, setStats] = useState<CapTableStats>({
+    totalShares: 0,
+    totalShareholders: 0,
+    verifiedData: 0,
+    avgOwnership: 0
+  });
 
   const { status, initialize, isInitialized } = useFhevm();
-  const { encrypt, isEncrypting } = useEncrypt();
+  const { encrypt, isEncrypting} = useEncrypt();
   const { verifyDecryption, isDecrypting: fheIsDecrypting } = useDecrypt();
 
   useEffect(() => {
     const initFhevmAfterConnection = async () => {
-      if (!isConnected || isInitialized || fhevmInitializing) return;
+      if (!isConnected) return;
+      if (isInitialized) return;
+      if (fhevmInitializing) return;
       
       try {
         setFhevmInitializing(true);
         await initialize();
       } catch (error) {
+        console.error('Failed to initialize FHEVM:', error);
         setTransactionStatus({ 
           visible: true, 
           status: "error", 
-          message: "FHEVM initialization failed" 
+          message: "FHEVM initialization failed." 
         });
         setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       } finally {
@@ -97,12 +116,14 @@ const App: React.FC = () => {
       
       const businessIds = await contract.getAllBusinessIds();
       const shareholdersList: ShareholderData[] = [];
+      let totalShares = 0;
+      let verifiedCount = 0;
       
       for (const businessId of businessIds) {
         try {
           const businessData = await contract.getBusinessData(businessId);
-          shareholdersList.push({
-            id: businessId,
+          const shareholder: ShareholderData = {
+            id: parseInt(businessId.replace('shareholder-', '')) || Date.now(),
             name: businessData.name,
             shares: businessId,
             percentage: businessId,
@@ -112,13 +133,27 @@ const App: React.FC = () => {
             publicValue2: Number(businessData.publicValue2) || 0,
             isVerified: businessData.isVerified,
             decryptedValue: Number(businessData.decryptedValue) || 0
-          });
+          };
+          
+          shareholdersList.push(shareholder);
+          
+          if (shareholder.isVerified && shareholder.decryptedValue) {
+            totalShares += shareholder.decryptedValue;
+            verifiedCount++;
+          }
         } catch (e) {
           console.error('Error loading business data:', e);
         }
       }
       
       setShareholders(shareholdersList);
+      
+      setStats({
+        totalShares,
+        totalShareholders: shareholdersList.length,
+        verifiedData: verifiedCount,
+        avgOwnership: shareholdersList.length > 0 ? totalShares / shareholdersList.length : 0
+      });
     } catch (e) {
       setTransactionStatus({ visible: true, status: "error", message: "Failed to load data" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
@@ -153,7 +188,7 @@ const App: React.FC = () => {
         encryptedResult.proof,
         parseInt(newShareholderData.percentage) || 0,
         0,
-        "Shareholder Equity Data"
+        "Shareholder Equity Record"
       );
       
       setTransactionStatus({ visible: true, status: "pending", message: "Waiting for transaction confirmation..." });
@@ -169,8 +204,8 @@ const App: React.FC = () => {
       setNewShareholderData({ name: "", shares: "", percentage: "" });
     } catch (e: any) {
       const errorMessage = e.message?.includes("user rejected transaction") 
-        ? "Transaction rejected by user" 
-        : "Submission failed: " + (e.message || "Unknown error");
+        ? "Transaction rejected" 
+        : "Submission failed";
       setTransactionStatus({ visible: true, status: "error", message: errorMessage });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     } finally { 
@@ -178,7 +213,7 @@ const App: React.FC = () => {
     }
   };
 
-  const decryptShares = async (businessId: string): Promise<number | null> => {
+  const decryptData = async (businessId: string): Promise<number | null> => {
     if (!isConnected || !address) { 
       setTransactionStatus({ visible: true, status: "error", message: "Please connect wallet first" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
@@ -193,8 +228,16 @@ const App: React.FC = () => {
       const businessData = await contractRead.getBusinessData(businessId);
       if (businessData.isVerified) {
         const storedValue = Number(businessData.decryptedValue) || 0;
-        setTransactionStatus({ visible: true, status: "success", message: "Data already verified on-chain" });
-        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+        
+        setTransactionStatus({ 
+          visible: true, 
+          status: "success", 
+          message: "Data already verified" 
+        });
+        setTimeout(() => {
+          setTransactionStatus({ visible: false, status: "pending", message: "" });
+        }, 2000);
+        
         return storedValue;
       }
       
@@ -210,26 +253,39 @@ const App: React.FC = () => {
           contractWrite.verifyDecryption(businessId, abiEncodedClearValues, decryptionProof)
       );
       
-      setTransactionStatus({ visible: true, status: "pending", message: "Verifying decryption on-chain..." });
+      setTransactionStatus({ visible: true, status: "pending", message: "Verifying decryption..." });
       
       const clearValue = result.decryptionResult.clearValues[encryptedValueHandle];
       
       await loadData();
       
-      setTransactionStatus({ visible: true, status: "success", message: "Shares decrypted and verified successfully!" });
-      setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+      setTransactionStatus({ visible: true, status: "success", message: "Data decrypted successfully!" });
+      setTimeout(() => {
+        setTransactionStatus({ visible: false, status: "pending", message: "" });
+      }, 2000);
       
       return Number(clearValue);
       
     } catch (e: any) { 
       if (e.message?.includes("Data already verified")) {
-        setTransactionStatus({ visible: true, status: "success", message: "Data is already verified on-chain" });
-        setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+        setTransactionStatus({ 
+          visible: true, 
+          status: "success", 
+          message: "Data is already verified" 
+        });
+        setTimeout(() => {
+          setTransactionStatus({ visible: false, status: "pending", message: "" });
+        }, 2000);
+        
         await loadData();
         return null;
       }
       
-      setTransactionStatus({ visible: true, status: "error", message: "Decryption failed: " + (e.message || "Unknown error") });
+      setTransactionStatus({ 
+        visible: true, 
+        status: "error", 
+        message: "Decryption failed" 
+      });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
       return null; 
     } finally { 
@@ -237,31 +293,131 @@ const App: React.FC = () => {
     }
   };
 
-  const checkAvailability = async () => {
+  const callIsAvailable = async () => {
     try {
-      const contract = await getContractReadOnly();
+      const contract = await getContractWithSigner();
       if (!contract) return;
       
-      const available = await contract.isAvailable();
-      setTransactionStatus({ visible: true, status: "success", message: "Contract is available and ready!" });
-      setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 2000);
+      const tx = await contract.isAvailable();
+      await tx.wait();
+      
+      setTransactionStatus({ visible: true, status: "success", message: "Contract is available!" });
+      setTimeout(() => {
+        setTransactionStatus({ visible: false, status: "pending", message: "" });
+      }, 2000);
     } catch (e) {
-      setTransactionStatus({ visible: true, status: "error", message: "Availability check failed" });
+      setTransactionStatus({ visible: true, status: "error", message: "Contract call failed" });
       setTimeout(() => setTransactionStatus({ visible: false, status: "pending", message: "" }), 3000);
     }
   };
 
-  const filteredShareholders = shareholders.filter(shareholder => {
-    const matchesSearch = shareholder.name.toLowerCase().includes(searchTerm.toLowerCase());
-    const matchesTab = activeTab === "all" || 
-                      (activeTab === "verified" && shareholder.isVerified) ||
-                      (activeTab === "pending" && !shareholder.isVerified);
-    return matchesSearch && matchesTab;
-  });
+  const filteredShareholders = shareholders.filter(shareholder =>
+    shareholder.name.toLowerCase().includes(searchTerm.toLowerCase())
+  );
 
-  const totalShareholders = shareholders.length;
-  const verifiedShareholders = shareholders.filter(s => s.isVerified).length;
-  const totalShares = shareholders.reduce((sum, s) => sum + s.publicValue1, 0);
+  const totalPages = Math.ceil(filteredShareholders.length / itemsPerPage);
+  const startIndex = (currentPage - 1) * itemsPerPage;
+  const currentShareholders = filteredShareholders.slice(startIndex, startIndex + itemsPerPage);
+
+  const renderStatsDashboard = () => {
+    return (
+      <div className="dashboard-panels">
+        <div className="panel gradient-panel">
+          <h3>Total Shares</h3>
+          <div className="stat-value">{stats.totalShares.toLocaleString()}</div>
+          <div className="stat-trend">FHE Protected</div>
+        </div>
+        
+        <div className="panel gradient-panel">
+          <h3>Shareholders</h3>
+          <div className="stat-value">{stats.totalShareholders}</div>
+          <div className="stat-trend">Registered</div>
+        </div>
+        
+        <div className="panel gradient-panel">
+          <h3>Verified Data</h3>
+          <div className="stat-value">{stats.verifiedData}/{stats.totalShareholders}</div>
+          <div className="stat-trend">On-chain Verified</div>
+        </div>
+        
+        <div className="panel gradient-panel">
+          <h3>Avg Ownership</h3>
+          <div className="stat-value">{stats.avgOwnership.toFixed(1)}%</div>
+          <div className="stat-trend">Per Shareholder</div>
+        </div>
+      </div>
+    );
+  };
+
+  const renderOwnershipChart = () => {
+    const verifiedShareholders = shareholders.filter(s => s.isVerified && s.decryptedValue);
+    if (verifiedShareholders.length === 0) {
+      return (
+        <div className="no-data-chart">
+          <p>No verified ownership data available</p>
+          <p>Add and verify shareholders to see the chart</p>
+        </div>
+      );
+    }
+
+    return (
+      <div className="ownership-chart">
+        <div className="chart-container">
+          {verifiedShareholders.map((shareholder, index) => (
+            <div key={shareholder.id} className="chart-item">
+              <div className="chart-bar-container">
+                <div 
+                  className="chart-bar neon-bar"
+                  style={{ height: `${(shareholder.decryptedValue! / stats.totalShares) * 100}%` }}
+                >
+                  <span className="bar-value">{shareholder.decryptedValue}</span>
+                </div>
+              </div>
+              <div className="chart-label">{shareholder.name}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    );
+  };
+
+  const renderFHEFlow = () => {
+    return (
+      <div className="fhe-flow">
+        <div className="flow-step">
+          <div className="step-icon">🔒</div>
+          <div className="step-content">
+            <h4>Encrypt Shares</h4>
+            <p>Shareholder equity encrypted with FHE</p>
+          </div>
+        </div>
+        <div className="flow-arrow">→</div>
+        <div className="flow-step">
+          <div className="step-icon">📊</div>
+          <div className="step-content">
+            <h4>Store Securely</h4>
+            <p>Encrypted data stored on blockchain</p>
+          </div>
+        </div>
+        <div className="flow-arrow">→</div>
+        <div className="flow-step">
+          <div className="step-icon">🔓</div>
+          <div className="step-content">
+            <h4>Authorized Access</h4>
+            <p>Only authorized users can decrypt</p>
+          </div>
+        </div>
+        <div className="flow-arrow">→</div>
+        <div className="flow-step">
+          <div className="step-icon">✅</div>
+          <div className="step-content">
+            <h4>Verify On-chain</h4>
+            <p>Proof verification for transparency</p>
+          </div>
+        </div>
+      </div>
+    );
+  };
 
   if (!isConnected) {
     return (
@@ -269,30 +425,32 @@ const App: React.FC = () => {
         <header className="app-header">
           <div className="logo">
             <h1>CapTable FHE 🔐</h1>
-            <span>股权结构隐私表</span>
+            <p>Confidential Equity Management</p>
           </div>
           <div className="header-actions">
-            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+            <div className="wallet-connect-wrapper">
+              <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+            </div>
           </div>
         </header>
         
         <div className="connection-prompt">
           <div className="connection-content">
             <div className="connection-icon">🔐</div>
-            <h2>Connect Wallet to Access Encrypted Cap Table</h2>
-            <p>Secure shareholder equity management with fully homomorphic encryption</p>
+            <h2>Connect Wallet to Access Cap Table</h2>
+            <p>Connect your wallet to initialize the encrypted equity management system</p>
             <div className="connection-steps">
               <div className="step">
                 <span>1</span>
-                <p>Connect your wallet to initialize FHE system</p>
+                <p>Connect your wallet securely</p>
               </div>
               <div className="step">
                 <span>2</span>
-                <p>Manage encrypted shareholder data securely</p>
+                <p>FHE system initializes automatically</p>
               </div>
               <div className="step">
                 <span>3</span>
-                <p>Perform private dilution calculations</p>
+                <p>Manage encrypted shareholder equity</p>
               </div>
             </div>
           </div>
@@ -306,7 +464,7 @@ const App: React.FC = () => {
       <div className="loading-screen">
         <div className="fhe-spinner"></div>
         <p>Initializing FHE Encryption System...</p>
-        <p className="loading-note">Securing your cap table data</p>
+        <p className="loading-note">Securing equity data with fully homomorphic encryption</p>
       </div>
     );
   }
@@ -323,148 +481,114 @@ const App: React.FC = () => {
       <header className="app-header">
         <div className="logo">
           <h1>CapTable FHE 🔐</h1>
-          <span>股权结构隐私表</span>
+          <p>Confidential Equity Management</p>
         </div>
         
         <div className="header-actions">
-          <button onClick={checkAvailability} className="availability-btn">
-            Check Availability
+          <button onClick={callIsAvailable} className="test-btn">
+            Test Contract
           </button>
-          <button onClick={() => setShowCreateModal(true)} className="create-btn">
+          <button 
+            onClick={() => setShowCreateModal(true)} 
+            className="create-btn"
+          >
             + Add Shareholder
           </button>
-          <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+          <div className="wallet-connect-wrapper">
+            <ConnectButton accountStatus="address" chainStatus="icon" showBalance={false}/>
+          </div>
         </div>
       </header>
       
-      <div className="main-content">
+      <div className="main-content-container">
         <div className="dashboard-section">
-          <div className="stats-grid">
-            <div className="stat-card">
-              <div className="stat-value">{totalShareholders}</div>
-              <div className="stat-label">Total Shareholders</div>
-            </div>
-            <div className="stat-card">
-              <div className="stat-value">{verifiedShareholders}</div>
-              <div className="stat-label">Verified Records</div>
-            </div>
-            <div className="stat-card">
-              <div className="stat-value">{totalShares}%</div>
-              <div className="stat-label">Total Equity</div>
-            </div>
+          <h2>Equity Overview Dashboard</h2>
+          {renderStatsDashboard()}
+          
+          <div className="chart-section">
+            <h3>Ownership Distribution</h3>
+            {renderOwnershipChart()}
+          </div>
+          
+          <div className="fhe-info-panel">
+            <h3>FHE 🔐 Security Flow</h3>
+            {renderFHEFlow()}
           </div>
         </div>
-
-        <div className="controls-section">
-          <div className="search-filter">
-            <input
-              type="text"
-              placeholder="Search shareholders..."
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              className="search-input"
-            />
-            <div className="tab-filters">
-              <button className={activeTab === "all" ? "active" : ""} onClick={() => setActiveTab("all")}>All</button>
-              <button className={activeTab === "verified" ? "active" : ""} onClick={() => setActiveTab("verified")}>Verified</button>
-              <button className={activeTab === "pending" ? "active" : ""} onClick={() => setActiveTab("pending")}>Pending</button>
-            </div>
-          </div>
-          <button onClick={loadData} className="refresh-btn" disabled={isRefreshing}>
-            {isRefreshing ? "Refreshing..." : "Refresh Data"}
-          </button>
-        </div>
-
+        
         <div className="shareholders-section">
           <div className="section-header">
-            <h2>Shareholder Equity Table</h2>
-            <span className="section-subtitle">FHE Encrypted • Private • Secure</span>
+            <h2>Shareholder Management</h2>
+            <div className="header-actions">
+              <div className="search-box">
+                <input 
+                  type="text" 
+                  placeholder="Search shareholders..." 
+                  value={searchTerm}
+                  onChange={(e) => setSearchTerm(e.target.value)}
+                />
+              </div>
+              <button 
+                onClick={loadData} 
+                className="refresh-btn" 
+                disabled={isRefreshing}
+              >
+                {isRefreshing ? "Refreshing..." : "Refresh"}
+              </button>
+            </div>
           </div>
           
           <div className="shareholders-list">
-            {filteredShareholders.length === 0 ? (
-              <div className="empty-state">
-                <div className="empty-icon">👥</div>
+            {currentShareholders.length === 0 ? (
+              <div className="no-shareholders">
                 <p>No shareholders found</p>
-                <button className="create-btn" onClick={() => setShowCreateModal(true)}>
+                <button 
+                  className="create-btn" 
+                  onClick={() => setShowCreateModal(true)}
+                >
                   Add First Shareholder
                 </button>
               </div>
-            ) : (
-              filteredShareholders.map((shareholder, index) => (
-                <div 
-                  className={`shareholder-item ${shareholder.isVerified ? "verified" : "pending"}`}
-                  key={index}
-                  onClick={() => setSelectedShareholder(shareholder)}
-                >
-                  <div className="shareholder-header">
-                    <div className="shareholder-name">{shareholder.name}</div>
-                    <div className={`verification-status ${shareholder.isVerified ? "verified" : "pending"}`}>
-                      {shareholder.isVerified ? "✅ Verified" : "🔓 Pending"}
-                    </div>
-                  </div>
-                  <div className="shareholder-details">
-                    <div className="detail">
-                      <span>Equity:</span>
-                      <strong>{shareholder.publicValue1}%</strong>
-                    </div>
-                    <div className="detail">
-                      <span>Shares:</span>
-                      <strong>
-                        {shareholder.isVerified ? 
-                          `${shareholder.decryptedValue} (Verified)` : 
-                          "🔒 Encrypted"
-                        }
-                      </strong>
-                    </div>
-                    <div className="detail">
-                      <span>Added:</span>
-                      <strong>{new Date(shareholder.timestamp * 1000).toLocaleDateString()}</strong>
-                    </div>
+            ) : currentShareholders.map((shareholder, index) => (
+              <div 
+                className={`shareholder-item ${selectedShareholder?.id === shareholder.id ? "selected" : ""} ${shareholder.isVerified ? "verified" : ""}`} 
+                key={index}
+                onClick={() => setSelectedShareholder(shareholder)}
+              >
+                <div className="shareholder-header">
+                  <div className="shareholder-name">{shareholder.name}</div>
+                  <div className={`verification-status ${shareholder.isVerified ? "verified" : "pending"}`}>
+                    {shareholder.isVerified ? "✅ Verified" : "🔓 Pending"}
                   </div>
                 </div>
-              ))
-            )}
+                <div className="shareholder-details">
+                  <span>Ownership: {shareholder.publicValue1}%</span>
+                  <span>Added: {new Date(shareholder.timestamp * 1000).toLocaleDateString()}</span>
+                </div>
+                <div className="shareholder-shares">
+                  Shares: {shareholder.isVerified ? shareholder.decryptedValue?.toLocaleString() : "🔒 Encrypted"}
+                </div>
+              </div>
+            ))}
           </div>
-        </div>
-
-        <div className="info-panels">
-          <div className="info-panel">
-            <h3>FHE Security Flow</h3>
-            <div className="security-flow">
-              <div className="flow-step">
-                <div className="step-number">1</div>
-                <div className="step-content">
-                  <strong>Data Encryption</strong>
-                  <p>Share counts encrypted with FHE before storage</p>
-                </div>
-              </div>
-              <div className="flow-step">
-                <div className="step-number">2</div>
-                <div className="step-content">
-                  <strong>Private Computation</strong>
-                  <p>Dilution calculations performed on encrypted data</p>
-                </div>
-              </div>
-              <div className="flow-step">
-                <div className="step-number">3</div>
-                <div className="step-content">
-                  <strong>Secure Verification</strong>
-                  <p>Offline decryption with on-chain proof verification</p>
-                </div>
-              </div>
+          
+          {totalPages > 1 && (
+            <div className="pagination">
+              <button 
+                onClick={() => setCurrentPage(prev => Math.max(1, prev - 1))}
+                disabled={currentPage === 1}
+              >
+                Previous
+              </button>
+              <span>Page {currentPage} of {totalPages}</span>
+              <button 
+                onClick={() => setCurrentPage(prev => Math.min(totalPages, prev + 1))}
+                disabled={currentPage === totalPages}
+              >
+                Next
+              </button>
             </div>
-          </div>
-
-          <div className="info-panel">
-            <h3>Compliance Features</h3>
-            <ul className="compliance-list">
-              <li>✅ SEC Regulation D compliant</li>
-              <li>✅ GDPR privacy protection</li>
-              <li>✅ Audit trail preservation</li>
-              <li>✅ Real-time compliance checks</li>
-            </ul>
-          </div>
+          )}
         </div>
       </div>
       
@@ -484,11 +608,12 @@ const App: React.FC = () => {
           shareholder={selectedShareholder} 
           onClose={() => { 
             setSelectedShareholder(null); 
-            setDecryptedShares(null); 
+            setDecryptedData({ shares: null, percentage: null }); 
           }} 
-          decryptedShares={decryptedShares} 
+          decryptedData={decryptedData} 
+          setDecryptedData={setDecryptedData} 
           isDecrypting={isDecrypting || fheIsDecrypting} 
-          decryptShares={() => decryptShares(selectedShareholder.id)}
+          decryptData={() => decryptData(selectedShareholder.shares)}
         />
       )}
       
@@ -497,8 +622,8 @@ const App: React.FC = () => {
           <div className="transaction-content">
             <div className={`transaction-icon ${transactionStatus.status}`}>
               {transactionStatus.status === "pending" && <div className="fhe-spinner"></div>}
-              {transactionStatus.status === "success" && "✓"}
-              {transactionStatus.status === "error" && "✗"}
+              {transactionStatus.status === "success" && <div className="success-icon">✓</div>}
+              {transactionStatus.status === "error" && <div className="error-icon">✗</div>}
             </div>
             <div className="transaction-message">{transactionStatus.message}</div>
           </div>
@@ -536,8 +661,8 @@ const ModalCreateShareholder: React.FC<{
         
         <div className="modal-body">
           <div className="fhe-notice">
-            <strong>FHE 🔐 Protection</strong>
-            <p>Share count will be encrypted using fully homomorphic encryption</p>
+            <strong>FHE 🔐 Encryption Active</strong>
+            <p>Share quantity will be encrypted with fully homomorphic encryption</p>
           </div>
           
           <div className="form-group">
@@ -566,7 +691,7 @@ const ModalCreateShareholder: React.FC<{
           </div>
           
           <div className="form-group">
-            <label>Equity Percentage (1-100) *</label>
+            <label>Ownership Percentage (1-100) *</label>
             <input 
               type="number" 
               min="1" 
@@ -574,7 +699,7 @@ const ModalCreateShareholder: React.FC<{
               name="percentage" 
               value={shareholderData.percentage} 
               onChange={handleChange} 
-              placeholder="Enter equity percentage..." 
+              placeholder="Enter ownership percentage..." 
             />
             <div className="data-type-label">Public Data</div>
           </div>
@@ -598,14 +723,21 @@ const ModalCreateShareholder: React.FC<{
 const ShareholderDetailModal: React.FC<{
   shareholder: ShareholderData;
   onClose: () => void;
-  decryptedShares: number | null;
+  decryptedData: { shares: number | null; percentage: number | null };
+  setDecryptedData: (value: { shares: number | null; percentage: number | null }) => void;
   isDecrypting: boolean;
-  decryptShares: () => Promise<number | null>;
-}> = ({ shareholder, onClose, decryptedShares, isDecrypting, decryptShares }) => {
+  decryptData: () => Promise<number | null>;
+}> = ({ shareholder, onClose, decryptedData, setDecryptedData, isDecrypting, decryptData }) => {
   const handleDecrypt = async () => {
-    if (decryptedShares !== null) return;
+    if (decryptedData.shares !== null) { 
+      setDecryptedData({ shares: null, percentage: null }); 
+      return; 
+    }
     
-    const decrypted = await decryptShares();
+    const decrypted = await decryptData();
+    if (decrypted !== null) {
+      setDecryptedData({ shares: decrypted, percentage: decrypted });
+    }
   };
 
   return (
@@ -623,7 +755,7 @@ const ShareholderDetailModal: React.FC<{
               <strong>{shareholder.name}</strong>
             </div>
             <div className="info-item">
-              <span>Wallet Address:</span>
+              <span>Added by:</span>
               <strong>{shareholder.creator.substring(0, 6)}...{shareholder.creator.substring(38)}</strong>
             </div>
             <div className="info-item">
@@ -631,7 +763,7 @@ const ShareholderDetailModal: React.FC<{
               <strong>{new Date(shareholder.timestamp * 1000).toLocaleDateString()}</strong>
             </div>
             <div className="info-item">
-              <span>Equity Percentage:</span>
+              <span>Ownership Percentage:</span>
               <strong>{shareholder.publicValue1}%</strong>
             </div>
           </div>
@@ -643,61 +775,60 @@ const ShareholderDetailModal: React.FC<{
               <div className="data-label">Number of Shares:</div>
               <div className="data-value">
                 {shareholder.isVerified && shareholder.decryptedValue ? 
-                  `${shareholder.decryptedValue} shares (On-chain Verified)` : 
-                  decryptedShares !== null ? 
-                  `${decryptedShares} shares (Locally Decrypted)` : 
+                  `${shareholder.decryptedValue.toLocaleString()} (Verified)` : 
+                  decryptedData.shares !== null ? 
+                  `${decryptedData.shares.toLocaleString()} (Decrypted)` : 
                   "🔒 FHE Encrypted"
                 }
               </div>
               <button 
-                className={`decrypt-btn ${(shareholder.isVerified || decryptedShares !== null) ? 'decrypted' : ''}`}
+                className={`decrypt-btn ${(shareholder.isVerified || decryptedData.shares !== null) ? 'decrypted' : ''}`}
                 onClick={handleDecrypt} 
                 disabled={isDecrypting}
               >
-                {isDecrypting ? "🔓 Verifying..." :
-                 shareholder.isVerified ? "✅ Verified" :
-                 decryptedShares !== null ? "🔄 Re-verify" : "🔓 Verify Decryption"}
+                {isDecrypting ? (
+                  "🔓 Decrypting..."
+                ) : shareholder.isVerified ? (
+                  "✅ Verified"
+                ) : decryptedData.shares !== null ? (
+                  "🔄 Re-verify"
+                ) : (
+                  "🔓 Decrypt Shares"
+                )}
               </button>
             </div>
             
             <div className="fhe-info">
               <div className="fhe-icon">🔐</div>
               <div>
-                <strong>FHE 🔐 Secure Verification</strong>
-                <p>Share count is encrypted on-chain. Verification performs offline decryption with on-chain proof validation.</p>
+                <strong>FHE Protected Data</strong>
+                <p>Share quantities are encrypted on-chain. Click to decrypt with authorized access.</p>
               </div>
             </div>
           </div>
           
-          {(shareholder.isVerified || decryptedShares !== null) && (
-            <div className="analysis-section">
-              <h3>Ownership Analysis</h3>
-              <div className="ownership-chart">
-                <div className="chart-bar">
-                  <div 
-                    className="bar-fill" 
-                    style={{ width: `${shareholder.publicValue1}%` }}
-                  >
-                    <span className="bar-value">{shareholder.publicValue1}% Equity</span>
-                  </div>
-                </div>
-              </div>
-              
-              <div className="verified-data">
-                <div className="data-point">
-                  <span>Verified Shares:</span>
-                  <strong>
+          {(shareholder.isVerified || decryptedData.shares !== null) && (
+            <div className="equity-summary">
+              <h3>Equity Summary</h3>
+              <div className="summary-cards">
+                <div className="summary-card">
+                  <div className="card-value">
                     {shareholder.isVerified ? 
-                      `${shareholder.decryptedValue} shares` : 
-                      `${decryptedShares} shares`
+                      shareholder.decryptedValue?.toLocaleString() : 
+                      decryptedData.shares?.toLocaleString()
                     }
-                  </strong>
+                  </div>
+                  <div className="card-label">Total Shares</div>
                 </div>
-                <div className="data-point">
-                  <span>Verification Status:</span>
-                  <strong className={shareholder.isVerified ? "verified" : "local"}>
-                    {shareholder.isVerified ? 'On-chain Verified' : 'Locally Decrypted'}
-                  </strong>
+                <div className="summary-card">
+                  <div className="card-value">{shareholder.publicValue1}%</div>
+                  <div className="card-label">Ownership</div>
+                </div>
+                <div className="summary-card">
+                  <div className="card-value">
+                    {shareholder.isVerified ? '✅' : '🔓'}
+                  </div>
+                  <div className="card-label">Status</div>
                 </div>
               </div>
             </div>
@@ -707,7 +838,11 @@ const ShareholderDetailModal: React.FC<{
         <div className="modal-footer">
           <button onClick={onClose} className="close-btn">Close</button>
           {!shareholder.isVerified && (
-            <button onClick={handleDecrypt} disabled={isDecrypting} className="verify-btn">
+            <button 
+              onClick={handleDecrypt} 
+              disabled={isDecrypting}
+              className="verify-btn"
+            >
               {isDecrypting ? "Verifying..." : "Verify on-chain"}
             </button>
           )}
